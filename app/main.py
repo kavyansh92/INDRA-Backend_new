@@ -24,9 +24,12 @@ for origin in extra_origins:
     if origin not in origins:
         origins.append(origin)
 
+from app.models.flood_model import load_model
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=r"https?://(localhost|.*\.vercel\.app|.*\.onrender\.com)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -38,6 +41,10 @@ app.include_router(historical_router, prefix="/api")
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(bind=engine)
+    try:
+        load_model()
+    except Exception as exc:
+        print(f"[startup] ML model load failed: {exc}")
 
 import asyncio
 from app.db.session import SessionLocal

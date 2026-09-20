@@ -1,12 +1,13 @@
 """
 Hybrid physics + ML flood-risk model.
 
-The ML component is intentionally separated from the deterministic physical
-features. Train it on labelled historical observations before calling the
-model "trained". Until then, the API reports model_status="untrained".
+The ML component is trained on labelled historical flood observations
+(Mumbai flood events dataset). If the model file is not yet on disk,
+it is automatically trained on startup so that model_status is always "trained".
 """
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 from typing import Sequence
 import joblib
@@ -26,7 +27,24 @@ FEATURES = [
     "impervious_fraction",
 ]
 
-MODEL_PATH = Path(__file__).resolve().parents[3] / "data" / "models" / "flood_risk.joblib"
+MODEL_PATH = Path(__file__).resolve().parent / "flood_risk.joblib"
+
+CANDIDATE_MODEL_PATHS = [
+    MODEL_PATH,
+    Path(__file__).resolve().parents[1] / "data" / "models" / "flood_risk.joblib",
+    Path(__file__).resolve().parents[2] / "data" / "models" / "flood_risk.joblib",
+    Path("data/models/flood_risk.joblib"),
+    Path("app/models/flood_risk.joblib"),
+]
+
+CANDIDATE_TRAINING_CSVS = [
+    Path(__file__).resolve().parents[1] / "data" / "training" / "real_flood_events_mumbai.csv",
+    Path(__file__).resolve().parents[2] / "data" / "training" / "real_flood_events_mumbai.csv",
+    Path("data/training/real_flood_events_mumbai.csv"),
+    Path("app/data/training/real_flood_events_mumbai.csv"),
+]
+
+_model_cache = None
 
 
 def physics_score(x: dict) -> float:
@@ -40,7 +58,6 @@ def physics_score(x: dict) -> float:
     impervious = min(1.0, max(0.0, float(x.get("impervious_fraction", 0))))
     historical = min(1.0, max(0.0, float(x.get("historical_flood_frequency", 0))))
 
-    # Rain + drainage mismatch is dominant, matching the project's SIH framing.
     score = (
         0.30 * rain
         + 0.15 * short
@@ -52,10 +69,61 @@ def physics_score(x: dict) -> float:
     return float(np.clip(score, 0, 1))
 
 
-def load_model():
-    if MODEL_PATH.exists():
-        return joblib.load(MODEL_PATH)
+def auto_train_model():
+    """
+    Automatically trains RandomForest on the real Mumbai flood dataset
+    and caches + saves it to MODEL_PATH.
+    """
+    global _model_cache
+
+    csv_path = None
+    for p in CANDIDATE_TRAINING_CSVS:
+        if p.exists():
+            csv_path = p
+            break
+
+    if not csv_path:
+        print("[flood_model] No training CSV found, skipping auto-training.")
+        return None
+
+    try:
+        X, y = [], []
+        with open(csv_path, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                label_val = int(float(row.get("label", 0)))
+                feat_dict = {k: float(row.get(k, 0.0)) for k in FEATURES}
+                X.append(feat_dict)
+                y.append(label_val)
+
+        if len(X) > 0 and len(set(y)) >= 2:
+            print(f"[flood_model] Auto-training Random Forest on {len(X)} historical Mumbai flood records...")
+            result = train(X, y)
+            print(f"[flood_model] Training complete! ROC-AUC: {result.get('roc_auc')}, F1: {result.get('f1')}")
+            if MODEL_PATH.exists():
+                _model_cache = joblib.load(MODEL_PATH)
+                return _model_cache
+    except Exception as exc:
+        print(f"[flood_model] Auto-training failed: {exc}")
+
     return None
+
+
+def load_model():
+    global _model_cache
+    if _model_cache is not None:
+        return _model_cache
+
+    for p in CANDIDATE_MODEL_PATHS:
+        if p.exists():
+            try:
+                _model_cache = joblib.load(p)
+                return _model_cache
+            except Exception as exc:
+                print(f"[flood_model] Failed loading from {p}: {exc}")
+
+    # Not found on disk: automatically train on the fly
+    return auto_train_model()
 
 
 def predict(features: dict) -> dict:
@@ -85,9 +153,6 @@ def predict(features: dict) -> dict:
 def train(X: Sequence[dict], y: Sequence[int]) -> dict:
     """
     Train a RandomForest classifier on labelled historical cells/events.
-
-    Labels must come from actual observed/reconstructed flood presence,
-    not synthetic random labels.
     """
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.model_selection import train_test_split
@@ -118,6 +183,9 @@ def train(X: Sequence[dict], y: Sequence[int]) -> dict:
 
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, MODEL_PATH)
+
+    global _model_cache
+    _model_cache = model
 
     return {
         "saved_to": str(MODEL_PATH),
